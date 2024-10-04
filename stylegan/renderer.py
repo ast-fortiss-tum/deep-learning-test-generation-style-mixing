@@ -1,11 +1,3 @@
-# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
 import sys
 import copy
 import traceback
@@ -16,9 +8,10 @@ import torch.nn
 import matplotlib.cm
 import dnnlib
 from torch_utils.ops import upfirdn2d
-import stylegan.legacy # pylint: disable=import-error
+from config import INTERPOLATION_ALPHA, TRUNC_PSI
+import stylegan.legacy  
+import config
 
-#----------------------------------------------------------------------------
 
 class CapturedException(Exception):
     def __init__(self, msg=None):
@@ -32,14 +25,10 @@ class CapturedException(Exception):
         assert isinstance(msg, str)
         super().__init__(msg)
 
-#----------------------------------------------------------------------------
-
 class CaptureSuccess(Exception):
     def __init__(self, out):
         super().__init__()
         self.out = out
-
-#----------------------------------------------------------------------------
 
 def _sinc(x):
     y = (x * np.pi).abs()
@@ -50,31 +39,24 @@ def _lanczos_window(x, a):
     x = x.abs() / a
     return torch.where(x < 1, _sinc(x), torch.zeros_like(x))
 
-#----------------------------------------------------------------------------
-
 def _construct_affine_bandlimit_filter(mat, a=3, amax=16, aflt=64, up=4, cutoff_in=1, cutoff_out=1):
     assert a <= amax < aflt
     mat = torch.as_tensor(mat).to(torch.float32)
 
-    # Construct 2D filter taps in input & output coordinate spaces.
     taps = ((torch.arange(aflt * up * 2 - 1, device=mat.device) + 1) / up - aflt).roll(1 - aflt * up)
     yi, xi = torch.meshgrid(taps, taps)
     xo, yo = (torch.stack([xi, yi], dim=2) @ mat[:2, :2].t()).unbind(2)
 
-    # Convolution of two oriented 2D sinc filters.
     fi = _sinc(xi * cutoff_in) * _sinc(yi * cutoff_in)
     fo = _sinc(xo * cutoff_out) * _sinc(yo * cutoff_out)
     f = torch.fft.ifftn(torch.fft.fftn(fi) * torch.fft.fftn(fo)).real
 
-    # Convolution of two oriented 2D Lanczos windows.
     wi = _lanczos_window(xi, a) * _lanczos_window(yi, a)
     wo = _lanczos_window(xo, a) * _lanczos_window(yo, a)
     w = torch.fft.ifftn(torch.fft.fftn(wi) * torch.fft.fftn(wo)).real
 
-    # Construct windowed FIR filter.
     f = f * w
 
-    # Finalize.
     c = (aflt - amax) * up
     f = f.roll([aflt * up - 1] * 2, dims=[0,1])[c:-c, c:-c]
     f = torch.nn.functional.pad(f, [0, 1, 0, 1]).reshape(amax * 2, up, amax * 2, up)
@@ -82,18 +64,14 @@ def _construct_affine_bandlimit_filter(mat, a=3, amax=16, aflt=64, up=4, cutoff_
     f = f.reshape(amax * 2 * up, amax * 2 * up)[:-1, :-1]
     return f
 
-#----------------------------------------------------------------------------
-
 def _apply_affine_transformation(x, mat, up=4, **filter_kwargs):
     _N, _C, H, W = x.shape
     mat = torch.as_tensor(mat).to(dtype=torch.float32, device=x.device)
 
-    # Construct filter.
     f = _construct_affine_bandlimit_filter(mat, up=up, **filter_kwargs)
     assert f.ndim == 2 and f.shape[0] == f.shape[1] and f.shape[0] % 2 == 1
     p = f.shape[0] // 2
 
-    # Construct sampling grid.
     theta = mat.inverse()
     theta[:2, 2] *= 2
     theta[0, 2] += 1 / up / W
@@ -103,58 +81,37 @@ def _apply_affine_transformation(x, mat, up=4, **filter_kwargs):
     theta = theta[:2, :3].unsqueeze(0).repeat([x.shape[0], 1, 1])
     g = torch.nn.functional.affine_grid(theta, x.shape, align_corners=False)
 
-    # Resample image.
     y = upfirdn2d.upsample2d(x=x, f=f, up=up, padding=p)
     z = torch.nn.functional.grid_sample(y, g, mode='bilinear', padding_mode='zeros', align_corners=False)
 
-    # Form mask.
     m = torch.zeros_like(y)
     c = p * 2 + 1
     m[:, :, c:-c, c:-c] = 1
     m = torch.nn.functional.grid_sample(m, g, mode='nearest', padding_mode='zeros', align_corners=False)
     return z, m
 
-#----------------------------------------------------------------------------
-
 class Renderer:
     def __init__(self, disable_timing=False):
-        self._device        = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-        self._dtype         = torch.float32 if self._device.type == 'mps' else torch.float64
-        self._pkl_data      = dict()    # {pkl: dict | CapturedException, ...}
-        self._networks      = dict()    # {cache_key: torch.nn.Module, ...}
-        self._pinned_bufs   = dict()    # {(shape, dtype): torch.Tensor, ...}
-        self._cmaps         = dict()    # {name: torch.Tensor, ...}
-        self._is_timing     = False
-        if not disable_timing:
-            self._start_event   = torch.cuda.Event(enable_timing=True)
-            self._end_event     = torch.cuda.Event(enable_timing=True)
+        self._device = torch.device('cpu')
+        self._dtype = torch.float32 if self._device.type == 'mps' else torch.float64
+        self._pkl_data = dict()
+        self._networks = dict()
+        self._cmaps = dict()
+        self._is_timing = False
         self._disable_timing = disable_timing
-        self._net_layers    = dict()    # {cache_key: [dnnlib.EasyDict, ...], ...}
+        self._net_layers = dict()
 
     def render(self, **args):
-        if self._disable_timing:
-            self._is_timing = False
-        else:
-            self._start_event.record(torch.cuda.current_stream(self._device))
-            self._is_timing = True
-        self._start_event.record(torch.cuda.current_stream(self._device))
+        self._is_timing = False
         res = dnnlib.EasyDict()
         try:
             self._render_impl(res, **args)
         except:
             res.error = CapturedException()
-        if not self._disable_timing:
-            self._end_event.record(torch.cuda.current_stream(self._device))
-        # if 'image' in res:
-        #     res.image = self.to_cpu(res.image).numpy()
         if 'stats' in res:
-            res.stats = self.to_cpu(res.stats).numpy()
+            res.stats = res.stats.cpu().numpy()
         if 'error' in res:
             res.error = str(res.error)
-        if self._is_timing and not self._disable_timing:
-            self._end_event.synchronize()
-            res.render_time = self._start_event.elapsed_time(self._end_event) * 1e-3
-            self._is_timing = False
         return res
 
     def get_network(self, pkl, key, **tweak_kwargs):
@@ -190,29 +147,13 @@ class Renderer:
         return net
 
     def _tweak_network(self, net):
-        # Print diagnostics.
-        #for name, value in misc.named_params_and_buffers(net):
-        #    if name.endswith('.magnitude_ema'):
-        #        value = value.rsqrt().numpy()
-        #        print(f'{name:<50s}{np.min(value):<16g}{np.max(value):g}')
-        #    if name.endswith('.weight') and value.ndim == 4:
-        #        value = value.square().mean([1,2,3]).sqrt().numpy()
-        #        print(f'{name:<50s}{np.min(value):<16g}{np.max(value):g}')
         return net
 
-    def _get_pinned_buf(self, ref):
-        key = (tuple(ref.shape), ref.dtype)
-        buf = self._pinned_bufs.get(key, None)
-        if buf is None:
-            buf = torch.empty(ref.shape, dtype=ref.dtype).pin_memory()
-            self._pinned_bufs[key] = buf
-        return buf
-
     def to_device(self, buf):
-        return self._get_pinned_buf(buf).copy_(buf).to(self._device)
+        return buf.to(self._device)
 
     def to_cpu(self, buf):
-        return self._get_pinned_buf(buf).copy_(buf).clone()
+        return buf.cpu()
 
     def _ignore_timing(self):
         self._is_timing = False
@@ -230,33 +171,27 @@ class Renderer:
         return x
 
     def _render_impl(self, res,
-        pkl             = None,
-        w0_seeds        = [[0, 1]],
-        w_load          = None,
-        w_load_seed     = None,
-        class_idx       = None,
-        mixclass_idx    = None,
-        stylemix_idx    = [],
-        stylemix_seed   = None,
-        trunc_psi       = 1,
-        trunc_cutoff    = 0,
-        random_seed     = 0,
-        noise_mode      = 'const',
-        force_fp32      = False,
-        layer_name      = None,
-        sel_channels    = 3,
-        base_channel    = 0,
-        img_scale_db    = 0,
-        img_normalize   = False,
-        to_pil          = False,
-        input_transform = None,
-        untransform     = False,
+        pkl=None,
+        w0_seeds=[[0, 1]],
+        w_load=None,
+        w_load_seed=None,
+        class_idx=None,
+        mixclass_idx=None,
+        stylemix_idx=[],
+        stylemix_seed=None,
+        trunc_cutoff= config.TRUNC_CUTOFF,
+        random_seed=0,
+        noise_mode='random',
+        force_fp32=False,
+        layer_name=None,
+        sel_channels=3,
+        base_channel=0,
+        img_scale_db=0,
+        img_normalize=False,
+        to_pil=False,
+        input_transform=None,
+        untransform=False,
     ):
-        # print(f"trunc_psi: {trunc_psi}")
-        # print(f"trunc_cutoff: {trunc_cutoff}")
-
-
-        # Dig up network details.
         G = self.get_network(pkl, 'G_ema')
         self.G = G
         res.img_resolution = G.img_resolution
@@ -264,7 +199,6 @@ class Renderer:
         res.has_noise = any('noise_const' in name for name, _buf in G.synthesis.named_buffers())
         res.has_input_transform = (hasattr(G.synthesis, 'input') and hasattr(G.synthesis.input, 'transform'))
 
-        # Set input transform.
         if res.has_input_transform:
             m = np.eye(3)
             try:
@@ -290,7 +224,6 @@ class Renderer:
         else:
             all_seeds = w0_zs_seeds
 
-
         w0_cs = np.zeros([len(w0_seeds), G.c_dim], dtype=np.float32)
         if G.c_dim > 0:
             if class_idx is not None:
@@ -311,26 +244,23 @@ class Renderer:
             all_cs = w0_cs
 
         print(f"class: {class_idx}, w0_seed: {w0_seeds}, mixclass_idx:{mixclass_idx} , stylemix_seed:{stylemix_seed}, stylemix_idx:{stylemix_idx}")
-        # print(f"all_cs: {all_cs}")
 
         all_zs = np.zeros([len(all_seeds), G.z_dim], dtype=np.float32)
         for idx, seed in enumerate(all_seeds):
             rnd = np.random.RandomState(seed)
             all_zs[idx] = rnd.randn(G.z_dim)
 
-        # Run mapping network.
         w_avg = G.mapping.w_avg
-        if self._device.type == 'mps':
-            all_zs = torch.from_numpy(all_zs).to(self._device, dtype=self._dtype)
-            all_cs = torch.from_numpy(all_cs).to(self._device, dtype=self._dtype)
-            if w_load is not None:
-                w_load = torch.from_numpy(w_load).to(self._device, dtype=self._dtype).squeeze(0)
-        else:
-            all_zs = self.to_device(torch.from_numpy(all_zs))
-            all_cs = self.to_device(torch.from_numpy(all_cs))
-            if w_load is not None:
-                w_load = self.to_device(torch.from_numpy(w_load)).squeeze(0)
-        all_ws = G.mapping(z=all_zs, c=all_cs, truncation_psi=trunc_psi, truncation_cutoff=trunc_cutoff) - w_avg
+        all_zs = self.to_device(torch.from_numpy(all_zs))
+        all_cs = self.to_device(torch.from_numpy(all_cs))
+        if w_load is not None:
+            w_load = self.to_device(torch.from_numpy(w_load)).squeeze(0)
+
+
+        #print(f"Latent vectors before truncation: {all_zs}")
+        all_ws = G.mapping(z=all_zs, c=all_cs, truncation_psi=TRUNC_PSI, truncation_cutoff=trunc_cutoff) - w_avg
+        #print(f"Latent vectors after truncation: {all_ws}")
+
         all_ws = dict(zip(all_seeds, all_ws))
 
         if w_load is not None:
@@ -341,33 +271,32 @@ class Renderer:
                     elif w_load_seed is None:
                         all_ws[seed] = w_load
 
-        # Calculate final W.
         w = torch.stack([all_ws[seed] * weight for seed, weight in w0_seeds]).sum(dim=0, keepdim=True)
         stylemix_idx = [idx for idx in stylemix_idx if 0 <= idx < G.num_ws]
         if stylemix_seed is not None and len(stylemix_idx) > 0:
-            w[:, stylemix_idx] = all_ws[stylemix_seed][np.newaxis, stylemix_idx]
+            w2 = all_ws[stylemix_seed][np.newaxis, :]
+            for idx in stylemix_idx:
+
+                # Linear interpolation
+                w[:, idx] = INTERPOLATION_ALPHA * w2[:, idx] + (1 - INTERPOLATION_ALPHA) * w[:, idx]
+
         if w_load is None:
             w += w_avg
 
-        # Run synthesis network.
         synthesis_kwargs = dnnlib.EasyDict(noise_mode=noise_mode, force_fp32=force_fp32)
         torch.manual_seed(random_seed)
         out, layers = self.run_synthesis_net(G.synthesis, w, capture_layer=layer_name, **synthesis_kwargs)
 
-        # Update layer list.
         cache_key = (G.synthesis, tuple(sorted(synthesis_kwargs.items())))
         if cache_key not in self._net_layers:
             if layer_name is not None:
                 torch.manual_seed(random_seed)
                 _out, layers = self.run_synthesis_net(G.synthesis, w, **synthesis_kwargs)
             self._net_layers[cache_key] = layers
-        # res.layers = self._net_layers[cache_key]
 
-        # Untransform.
         if untransform and res.has_input_transform:
-            out, _mask = _apply_affine_transformation(out.to(torch.float32), G.synthesis.input.transform, amax=6) # Override amax to hit the fast path in upfirdn2d.
+            out, _mask = _apply_affine_transformation(out.to(torch.float32), G.synthesis.input.transform, amax=6)
 
-        # Select channels and compute statistics.
         out = out[0].to(torch.float32)
         if sel_channels > out.shape[0]:
             sel_channels = 1
@@ -379,26 +308,23 @@ class Renderer:
             out.norm(float('inf')), sel.norm(float('inf')),
         ])
 
-        # Scale and convert to uint8.
         img = sel
         if img_normalize:
             img = img / img.norm(float('inf'), dim=[1,2], keepdim=True).clip(1e-8, 1e8)
         img = img * (10 ** (img_scale_db / 20))
         img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
-        # print(f"Renderer: image size = {img.shape}")
         if to_pil:
             from PIL import Image
             img = img.cpu().numpy()
             if img.shape[2] == 1:
-                img = img.squeeze()  # Remove singleton dimensions
+                img = img.squeeze()
             img = Image.fromarray(img)
         res.image = img
 
-        # print(f"Renderer: W size = {w.shape}")
         res.w = w.detach().cpu().numpy()
 
     @staticmethod
-    def run_synthesis_net(net, *args, capture_layer=None, **kwargs): # => out, layers
+    def run_synthesis_net(net, *args, capture_layer=None, **kwargs):
         submodule_names = {mod: name for name, mod in net.named_modules()}
         unique_names = set()
         layers = []
@@ -407,7 +333,7 @@ class Renderer:
             outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
             outputs = [out for out in outputs if isinstance(out, torch.Tensor) and out.ndim in [4, 5]]
             for idx, out in enumerate(outputs):
-                if out.ndim == 5: # G-CNN => remove group dimension.
+                if out.ndim == 5:
                     out = out.mean(2)
                 name = submodule_names[module]
                 if name == '':
@@ -434,5 +360,4 @@ class Renderer:
         for hook in hooks:
             hook.remove()
         return out, layers
-
-#----------------------------------------------------------------------------
+    

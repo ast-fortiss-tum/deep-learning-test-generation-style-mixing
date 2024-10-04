@@ -66,7 +66,7 @@ def Model1_fmnist(input_tensor=None, train=False):
         # Printing out training execution time
         # print("--- %s seconds ---" % (time.clock() - start_time))
     else:
-        model.load_weights('f-mnist/models/Model1_fmnist.h5')
+        model.load_weights('/Users/giorgi/Desktop/kloni/Test_models/f-mnist/models/Model1_fmnist.h5')
         print('FMNIST Model1 loaded')
     return model
 

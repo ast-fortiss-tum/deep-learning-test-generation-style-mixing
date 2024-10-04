@@ -1,26 +1,35 @@
 import dnnlib
-from stylegan.renderer import Renderer
 
-DEVICE = 'cuda'
+DEVICE = 'CPU'
 
 # StyleGAN2 model checkpoint
-INIT_PKL = 'checkpoints/stylegan2_mnist_32x32-con.pkl'
+INIT_PKL = '/Users/giorgi/Desktop/kloni/Test_models/Checkpoints/Checkpoints/stylegan2_mnist_32x32-con.pkl'
 # Model used for prediction
 # MODEL = 'mnist/models/cnnClassifier.h5'
-MODEL = 'mnist/models/cnnClassifier_lowLR.h5'
+MODEL = '/Users/giorgi/Desktop/kloni/Test_models/mnist/models/cnnClassifier_lowLR.h5'
 num_classes = 10
 
 # Path to save the generated frontier pairs
 FRONTIER_PAIRS = 'mnist/eval'
+
 # List of layers to perform stylemix
 STYLEMIX_LAYERS = [[7], [6], [5], [4], [3], [5,6], [3,4], [3,4,5,6]]
+
 # Number of frontier pair samples to generate
-SEARCH_LIMIT = 100
+SEARCH_LIMIT = 15 # Reduced from default 100
 # Max number of stylemix seeds
 STYLEMIX_SEED_LIMIT = 100
 
 SSIM_THRESHOLD = 0.95
 L2_RANGE = 0.2
+
+# Value for interpolation
+INTERPOLATION_ALPHA = 0.05
+
+# Value for truncation psi
+TRUNC_PSI = 0.5
+TRUNC_CUTOFF = 6
+print(f"Config: TRUNC_PSI is set to {TRUNC_PSI}")
 
 STYLEGAN_INIT = {
     "generator_params": dnnlib.EasyDict(),
@@ -32,10 +41,10 @@ STYLEGAN_INIT = {
         "stylemix_idx": [],
         "patch_idxs": None,
         "stylemix_seed": None,
-        "trunc_psi": 1,
-        "trunc_cutoff": 0,
+        "trunc_psi": TRUNC_PSI,
+        "trunc_cutoff": TRUNC_CUTOFF,
         "random_seed": 0,
-        "noise_mode": 'const',
+        "noise_mode": 'random',
         "force_fp32": False,
         "layer_name": None,
         "sel_channels": 3,
@@ -43,8 +52,8 @@ STYLEGAN_INIT = {
         "img_scale_db": 0,
         "img_normalize": True,
         "to_pil": True,
-        "input_transform" : None,
-        "untransform": False,
+        "input_transform": None,
+        "untransform": False
     },
     "device": DEVICE,
     "renderer": None,
@@ -89,7 +98,6 @@ MUTOFPROB = 0.5
 
 IMG_SIZE = 28
 
-
 # INITIALPOP = 'seeded'
 INITIALPOP = 'random'
 
@@ -101,6 +109,5 @@ REPORT_NAME = 'stats.csv'
 DATASET = 'mnist/original_dataset/janus_dataset_comparison.h5'
 EXPLABEL = 5
 
-#TODO: set interpreter
+# TODO: set interpreter
 INTERPRETER = '/home/vin/yes/envs/tf_gpu/bin/python'
-

@@ -116,7 +116,7 @@ class mimicry:
             label
         )
         if not m_accepted:
-            # Do not proceed if the image is not accepted at alpha=0
+            # Do not proceed if the image is not accepted at alpha = 0
             return None, None, None, None, None, None, None, None
 
         last_correct_image = interpolated_image.copy()
@@ -134,7 +134,7 @@ class mimicry:
             label
         )
         if m_accepted:
-            # Do not proceed if the image is still accepted at alpha=1.0
+            # Do not proceed if the image is still accepted at alpha = 1
             return None, None, None, None, None, None, None, None
 
         # Binary search for alpha where acceptance changes
@@ -164,7 +164,7 @@ class mimicry:
 
         # alpha_min is the last alpha where acceptance was True - Correctly classified
 
-        # Interpolated image at alpha=alpha_max (misclassified image)
+        # Interpolated image at alpha = alpha_max (misclassified image)
         interpolated_image = self.interpolate_with_mask(
             image_array, m_image_array, alpha=alpha_max, mask1=mask, mask2=m_mask
         )
@@ -175,10 +175,82 @@ class mimicry:
 
         return alpha_max, interpolated_image, confidence, m_predictions, last_correct_image, last_correct_alpha, last_correct_predictions, last_correct_confidence
 
+    # Binary search to find alpha where confidence is 0.5
+    def find_alpha_for_confidence(self, image_array, m_image_array, mask, m_mask, label, stylemix_cls, target_confidence=0.5, max_iterations=1000, tolerance=1e-15):
+        alpha_min = 0.0
+        alpha_max = 1.0
+        iteration = 0
+
+        # Compute confidence at alpha_min
+        interpolated_image = self.interpolate_with_mask(
+            image_array, m_image_array, alpha=alpha_min, mask1=mask, mask2=m_mask
+        )
+        _, confidence_min, _ = Predictor().predict_datapoint(
+            np.reshape(interpolated_image, (-1, 28, 28, 1)),
+            label
+        )
+
+        # Compute confidence at alpha_max
+        interpolated_image = self.interpolate_with_mask(
+            image_array, m_image_array, alpha=alpha_max, mask1=mask, mask2=m_mask
+        )
+        _, confidence_max, _ = Predictor().predict_datapoint(
+            np.reshape(interpolated_image, (-1, 28, 28, 1)),
+            label
+        )
+
+        # Compute f(alpha) = confidence(alpha) - target_confidence
+        f_min = confidence_min - target_confidence
+        f_max = confidence_max - target_confidence
+
+        # Check if root is bracketed
+        if f_min * f_max >= 0:
+            # Root is not bracketed
+            print("Cannot find confidence crossing target confidence in the interval [0,1]")
+            return None, None, None, None, None, None, None
+
+        # Bisection
+        while iteration < max_iterations and (alpha_max - alpha_min) > tolerance:
+            alpha = (alpha_min + alpha_max) / 2.0
+            interpolated_image = self.interpolate_with_mask(
+                image_array, m_image_array, alpha=alpha, mask1=mask, mask2=m_mask
+            )
+            _, confidence, predictions = Predictor().predict_datapoint(
+                np.reshape(interpolated_image, (-1, 28, 28, 1)),
+                label
+            )
+            f_alpha = confidence - target_confidence
+            print(f"Iteration {iteration}, Alpha: {alpha:.17f}, Confidence: {confidence:.17f}")
+
+            if abs(f_alpha) < tolerance:
+                # Found target confidence
+                return alpha, interpolated_image, confidence, predictions, alpha_min, alpha_max, iteration
+
+            if f_min * f_alpha < 0:
+                alpha_max = alpha
+                f_max = f_alpha
+            else:
+                alpha_min = alpha
+                f_min = f_alpha
+
+            iteration += 1
+
+        # After max_iterations or tolerance reached
+        alpha = (alpha_min + alpha_max) / 2.0
+        interpolated_image = self.interpolate_with_mask(
+            image_array, m_image_array, alpha=alpha, mask1=mask, mask2=m_mask
+        )
+        _, confidence, predictions = Predictor().predict_datapoint(
+            np.reshape(interpolated_image, (-1, 28, 28, 1)),
+            label
+        )
+        return alpha, interpolated_image, confidence, predictions, alpha_min, alpha_max, iteration
+
     def search(self):
         root = f"{FRONTIER_PAIRS}/{self.class_idx}/"
 
         frontier_seed_count = 0
+        tolerance = 1e-15  # Value for higher precision in confidence
 
         while frontier_seed_count < self.search_limit:
             state = self.state
@@ -204,7 +276,7 @@ class mimicry:
                 label
             )
 
-            digit_info["accepted"] = accepted.tolist()
+            digit_info["accepted"] = bool(accepted)
             digit_info["exp-confidence"] = float(confidence)
             digit_info["predictions"] = predictions.tolist()
 
@@ -238,32 +310,13 @@ class mimicry:
                                     # Create mask for the second image
                                     m_mask = self.create_mask(m_image)
 
-                                    # Check confidence at alpha = 1
-                                    alpha = 1.0
-                                    interpolated_image = self.interpolate_with_mask(
-                                        image_array, m_image_array, alpha=alpha, mask1=mask, mask2=m_mask
-                                    )
-                                    m_accepted, confidence, m_predictions = Predictor().predict_datapoint(
-                                        np.reshape(interpolated_image, (-1, 28, 28, 1)),
-                                        label
-                                    )
-
-                                    # If confidence is greater than 0.05 skip and start the next stylemixing
-                                    if confidence > 0.05:
-                                        print(f"Skipping stylemixing as confidence is {confidence:.4f} for alpha = 1")
-                                        self.stylemix_seed += 1
-                                        continue
-
-                                    # Proceed with interpolation if confidence is less than 0.05
-                                    print(f"Proceeding with interpolation as confidence is {confidence:.4f} for alpha = 1")
-
                                     # Use binary search to find alpha where acceptance changes
                                     result = self.find_alpha_for_acceptance_change(
                                         image_array, m_image_array, mask, m_mask, label, stylemix_cls, max_iterations=20, tolerance=1e-4
                                     )
 
                                     if result[0] is not None:
-                                        alpha, interpolated_image, confidence, m_predictions, last_correct_image, last_correct_alpha, last_correct_predictions, last_correct_confidence = result
+                                        alpha_max, interpolated_image, confidence, m_predictions, last_correct_image, last_correct_alpha, last_correct_predictions, last_correct_confidence = result
 
                                         m_class = np.argmax(m_predictions)
                                         m_accepted = False  # the point where acceptance became False
@@ -284,7 +337,7 @@ class mimicry:
                                                     os.makedirs(path, exist_ok=True)
                                                     image.save(img_path)
 
-                                                    digit_info["l2_norm"] = img_l2
+                                                    digit_info["l2_norm"] = float(img_l2)
                                                     with open(f"{path}/{seed_name}.json", 'w') as f:
                                                         json.dump(digit_info, f, sort_keys=True, indent=4)
 
@@ -300,7 +353,7 @@ class mimicry:
 
                                                     # Save metadata for correct image
                                                     correct_info = m_digit_info.copy()
-                                                    correct_info["alpha"] = last_correct_alpha
+                                                    correct_info["alpha"] = float(last_correct_alpha)
                                                     correct_info["accepted"] = True
                                                     correct_info["predictions"] = last_correct_predictions.tolist()
                                                     correct_info["exp-confidence"] = float(last_correct_confidence)
@@ -309,16 +362,16 @@ class mimicry:
 
                                                 # Save misclassified image
                                                 m_path = f"{path}/{stylemix_cls}"
-                                                m_name = f"{int(l2_distance)}-{int(ssi * 100)}-{self.stylemix_seed}-{stylemix_cls}-{layer[0]}-{alpha:.6f}-misclassified.png"
+                                                m_name = f"{int(l2_distance)}-{int(ssi * 100)}-{self.stylemix_seed}-{stylemix_cls}-{layer[0]}-{alpha_max:.6f}-misclassified.png"
                                                 os.makedirs(m_path, exist_ok=True)
                                                 m_digit_info["accepted"] = False
-                                                m_digit_info["predicted-class"] = m_class.tolist()
+                                                m_digit_info["predicted-class"] = int(m_class)
                                                 m_digit_info["exp-confidence"] = float(confidence)
                                                 m_digit_info["predictions"] = m_predictions.tolist()
                                                 m_digit_info["ssi"] = float(ssi)
-                                                m_digit_info["l2_norm"] = m_img_l2
-                                                m_digit_info["l2_distance"] = l2_distance
-                                                m_digit_info["alpha"] = alpha
+                                                m_digit_info["l2_norm"] = float(m_img_l2)
+                                                m_digit_info["l2_distance"] = float(l2_distance)
+                                                m_digit_info["alpha"] = float(alpha_max)
                                                 with open(f"{m_path}/{m_name}.json", 'w') as f:
                                                     json.dump(m_digit_info, f, sort_keys=True, indent=4)
 
@@ -330,7 +383,43 @@ class mimicry:
                                                 # Generate heatmap
                                                 self.save_difference_jetmap(image_array, interpolated_image, m_path, m_name)
 
+                                                # find image at confidence 0.5
+                                                result_conf = self.find_alpha_for_confidence(
+                                                    image_array, m_image_array, mask, m_mask, label, stylemix_cls, target_confidence=0.5, max_iterations=1000, tolerance=tolerance
+                                                )
+
+                                                if result_conf[0] is not None:
+                                                    alpha_conf, interpolated_image_conf, confidence_conf, m_predictions_conf, _, _, _ = result_conf
+
+                                                    # Save the image at confidence 0.5
+                                                    valid_mutation_conf, ssi_conf, l2_distance_conf, _, _ = validate_mutation(image_array, interpolated_image_conf)
+
+                                                    if valid_mutation_conf:
+                                                        conf_path = f"{path}/{stylemix_cls}/conf_0.5/"
+                                                        os.makedirs(conf_path, exist_ok=True)
+                                                        conf_img_name = f"{int(l2_distance_conf)}-{int(ssi_conf * 100)}-{self.stylemix_seed}-{stylemix_cls}-{layer[0]}-{alpha_conf:.17f}-conf0.5.png"
+
+                                                        interpolated_image_conf_uint8 = np.clip(interpolated_image_conf, 0, 255).astype(np.uint8)
+                                                        interpolated_pil_image_conf = Image.fromarray(interpolated_image_conf_uint8)
+                                                        interpolated_pil_image_conf.save(f"{conf_path}/{conf_img_name}.png")
+
+                                                        # Save metadata for image at confidence 0.5
+                                                        m_digit_info_conf = m_digit_info.copy()
+                                                        m_digit_info_conf["accepted"] = bool(confidence_conf >= 0.5)
+                                                        m_digit_info_conf["predicted-class"] = int(np.argmax(m_predictions_conf))
+                                                        m_digit_info_conf["exp-confidence"] = f"{confidence_conf:.20f}"
+                                                        m_digit_info_conf["predictions"] = m_predictions_conf.tolist()
+                                                        m_digit_info_conf["ssi"] = float(ssi_conf)
+                                                        m_digit_info_conf["l2_distance"] = float(l2_distance_conf)
+                                                        m_digit_info_conf["alpha"] = float(alpha_conf)
+                                                        with open(f"{conf_path}/{conf_img_name}.json", 'w') as f:
+                                                            json.dump(m_digit_info_conf, f, sort_keys=True, indent=4)
+                                                else:
+                                                    print("Could not find alpha where confidence reaches - 0.5")
+
                                                 break  # Break layer loop
+                                            else:
+                                                print("Invalid mutation - skipping")
                                         else:
                                             print(f"Misclassification to unexpected class {m_class}, expected {stylemix_cls}")
                                     else:
@@ -346,13 +435,13 @@ def run_mimicry(class_idx, w0_seed=0, step_size=1):
 
 if __name__ == "__main__":
 
-    #run_mimicry(class_idx=9)
-    #run_mimicry(class_idx=8)
-    #run_mimicry(class_idx=7)
-    #run_mimicry(class_idx=6)
-    #run_mimicry(class_idx=5)
-    #run_mimicry(class_idx=4)
-    #run_mimicry(class_idx=3)
+    # run_mimicry(class_idx=9)
+    # run_mimicry(class_idx=8)
+    # run_mimicry(class_idx=7)
+    # run_mimicry(class_idx=6)
+    # run_mimicry(class_idx=5)
+    # run_mimicry(class_idx=4)
+    # run_mimicry(class_idx=3)
     run_mimicry(class_idx=2)
-    #run_mimicry(class_idx=1)
-    #run_mimicry(class_idx=0)
+    # run_mimicry(class_idx=1)
+    # run_mimicry(class_idx=0)
